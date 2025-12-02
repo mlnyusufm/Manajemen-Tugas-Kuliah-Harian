@@ -99,14 +99,59 @@ export default function App() {
   const [categories, setCategories] = useState([]);
   const [selectedTask, setSelectedTask] = useState(null);
   const [selectedCategory, setSelectedCategory] = useState(null);
-
   const [loading, setLoading] = useState(false);
 
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  // Helper buat tampilan difficulty
+  const formatDifficulty = (d) => {
+    if (!d) return "-";
+    const lower = d.toLowerCase();
+    if (lower === "low") return "Low";
+    if (lower === "medium") return "Medium";
+    if (lower === "high") return "High";
+    return d;
+  };
+
+  /* --------- INIT AUTH (CEK SESSION + LISTENER) --------- */
   useEffect(() => {
-    loadAll();
+    const initAuth = async () => {
+      const {
+        data: { session },
+        error,
+      } = await supabase.auth.getSession();
+      if (error) console.error("Error getSession:", error);
+      setUser(session?.user ?? null);
+      setAuthLoading(false);
+    };
+
+    initAuth();
+
+    const {
+      data: authListener,
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+
+    return () => {
+      authListener.subscription.unsubscribe();
+    };
   }, []);
 
+  /* --------- LOAD DATA KALAU SUDAH LOGIN --------- */
+  useEffect(() => {
+    if (user) {
+      loadAll();
+    } else {
+      setTasks([]);
+      setCategories([]);
+    }
+  }, [user]);
+
   async function loadAll() {
+    if (!user) return;
+
     setLoading(true);
 
     const t = await API.getTasks();
@@ -114,19 +159,22 @@ export default function App() {
 
     const categoryMap = {};
     t.forEach((task) => {
-      if (!categoryMap[task.difficulty]) {
-        categoryMap[task.difficulty] = {
-          name: task.difficulty,
+      if (!task.difficulty) return;
+      const key = task.difficulty.toLowerCase();
+
+      if (!categoryMap[key]) {
+        categoryMap[key] = {
+          name: key,
           count: 1,
           color:
-            task.difficulty === "high"
+            key === "high"
               ? "#ef4444"
-              : task.difficulty === "medium"
+              : key === "medium"
               ? "#f59e0b"
               : "#3b82f6",
         };
       } else {
-        categoryMap[task.difficulty].count++;
+        categoryMap[key].count++;
       }
     });
 
@@ -136,6 +184,8 @@ export default function App() {
 
   async function toggleTask(id) {
     const task = tasks.find((t) => t.id === id);
+    if (!task) return;
+
     const newStatus = task.status === "completed" ? "pending" : "completed";
 
     await API.updateTaskStatus(id, newStatus);
@@ -144,29 +194,155 @@ export default function App() {
 
   async function openTask(id) {
     const data = await API.getTaskById(id);
+    if (!data) return;
     setSelectedTask(data);
     setPage("taskDetail");
   }
 
   async function openCategory(name) {
-    const filtered = tasks.filter((t) => t.difficulty === name);
+    const key = name.toLowerCase();
+    const filtered = tasks.filter(
+      (t) => (t.difficulty || "").toLowerCase() === key
+    );
 
     setSelectedCategory({
-      name,
+      name: key,
       tasks: filtered,
       count: filtered.length,
       color:
-        name === "high" ? "#ef4444" : name === "medium" ? "#f59e0b" : "#3b82f6",
+        key === "high" ? "#ef4444" : key === "medium" ? "#f59e0b" : "#3b82f6",
     });
 
     setPage("categoryDetail");
   }
 
   async function addNewTask(task) {
+    // user_id akan diisi otomatis oleh Supabase (default auth.uid())
     await API.addTask(task);
     await loadAll();
-    setPage("home");
   }
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    setPage("home");
+  };
+
+  /* ==========================================================
+                      PAGE: AUTH
+  ========================================================== */
+
+  const AuthPage = () => {
+    const [mode, setMode] = useState("login"); // 'login' | 'register'
+    const [email, setEmail] = useState("");
+    const [password, setPassword] = useState("");
+    const [authMessage, setAuthMessage] = useState("");
+    const [authBusy, setAuthBusy] = useState(false);
+
+    const toggleMode = () => {
+      setAuthMessage("");
+      setMode(mode === "login" ? "register" : "login");
+    };
+
+    const handleSubmit = async (e) => {
+      e.preventDefault();
+      setAuthMessage("");
+      setAuthBusy(true);
+
+      try {
+        if (mode === "register") {
+          const { error } = await supabase.auth.signUp({
+            email,
+            password,
+          });
+          if (error) throw error;
+          setAuthMessage(
+            "✅ Akun berhasil dibuat. Silakan cek email jika perlu verifikasi, lalu login."
+          );
+          setMode("login");
+        } else {
+          const { error } = await supabase.auth.signInWithPassword({
+            email,
+            password,
+          });
+          if (error) throw error;
+          setAuthMessage("✅ Login berhasil.");
+        }
+      } catch (err) {
+        console.error(err);
+        setAuthMessage("❌ " + err.message);
+      } finally {
+        setAuthBusy(false);
+      }
+    };
+
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+        <div className="w-full max-w-md bg-white shadow-lg rounded-2xl p-6">
+          <h1 className="text-2xl font-bold text-center mb-2">
+            Task Manager Kuliah
+          </h1>
+          <p className="text-center text-gray-500 mb-6 text-sm">
+            {mode === "login"
+              ? "Masuk untuk mengelola tugas kuliah harianmu."
+              : "Daftar akun baru untuk mulai menggunakan aplikasi."}
+          </p>
+
+          {authMessage && (
+            <div className="mb-4 p-3 rounded-xl text-sm text-center bg-blue-50 text-blue-700 border border-blue-200">
+              {authMessage}
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <div>
+              <p className="text-sm font-semibold mb-1">Email</p>
+              <input
+                type="email"
+                required
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="w-full p-3 border rounded-xl"
+              />
+            </div>
+
+            <div>
+              <p className="text-sm font-semibold mb-1">Password</p>
+              <input
+                type="password"
+                required
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="w-full p-3 border rounded-xl"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={authBusy}
+              className="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold disabled:opacity-50"
+            >
+              {authBusy
+                ? "Memproses..."
+                : mode === "login"
+                ? "Login"
+                : "Register"}
+            </button>
+          </form>
+
+          <p className="mt-4 text-center text-sm text-gray-600">
+            {mode === "login" ? "Belum punya akun? " : "Sudah punya akun? "}
+            <button
+              type="button"
+              onClick={toggleMode}
+              className="text-blue-600 font-semibold"
+            >
+              {mode === "login" ? "Daftar di sini" : "Login di sini"}
+            </button>
+          </p>
+        </div>
+      </div>
+    );
+  };
 
   /* ==========================================================
                         PAGE: HOME
@@ -199,7 +375,9 @@ export default function App() {
         </div>
 
         <div className="flex justify-between items-center mb-3">
-          <h2 className="text-lg font-bold text-gray-800">Tugas Kuliah Hari Ini</h2>
+          <h2 className="text-lg font-bold text-gray-800">
+            Tugas Kuliah Hari Ini
+          </h2>
           <button
             onClick={() => setPage("addTask")}
             className="text-blue-600 font-semibold text-sm"
@@ -251,14 +429,14 @@ export default function App() {
 
                     <span
                       className={`ml-3 px-2 py-0.5 rounded-lg text-xs font-medium ${
-                        task.difficulty === "high"
+                        (task.difficulty || "").toLowerCase() === "high"
                           ? "bg-red-100 text-red-600"
-                          : task.difficulty === "medium"
+                          : (task.difficulty || "").toLowerCase() === "medium"
                           ? "bg-yellow-100 text-yellow-600"
                           : "bg-blue-100 text-blue-600"
                       }`}
                     >
-                      {task.difficulty}
+                      {formatDifficulty(task.difficulty)}
                     </span>
                   </div>
                 </div>
@@ -294,7 +472,7 @@ export default function App() {
             </p>
             <p>
               <span className="text-gray-500">Kesulitan:</span>{" "}
-              {selectedTask.difficulty}
+              {formatDifficulty(selectedTask.difficulty)}
             </p>
             <p>
               <span className="text-gray-500">Deadline:</span>{" "}
@@ -388,9 +566,7 @@ export default function App() {
             <input
               type="text"
               value={form.title}
-              onChange={(e) =>
-                setForm({ ...form, title: e.target.value })
-              }
+              onChange={(e) => setForm({ ...form, title: e.target.value })}
               className="w-full p-3 border rounded-xl"
             />
           </div>
@@ -447,7 +623,7 @@ export default function App() {
   };
 
   /* ==========================================================
-                    PAGE: CATEGORIES
+                    PAGE: Kesulitan
 ========================================================== */
 
   const CategoriesPage = () => (
@@ -461,25 +637,26 @@ export default function App() {
 
       <div className="p-4 grid grid-cols-2 gap-4">
         {categories.map((cat) => (
-  <div
-    key={cat.name}
-    onClick={() => openCategory(cat.name)}
-    className="bg-white p-5 rounded-2xl shadow-sm border cursor-pointer hover:shadow-lg transition"
-    style={{ borderLeft: `5px solid ${cat.color}` }}
-  >
-    <div className="flex items-center gap-2 mb-2">
-      <Tag className="w-4 h-4" style={{ color: cat.color }} />
-      <p className="font-semibold text-gray-800">{cat.name}</p>
-    </div>
+          <div
+            key={cat.name}
+            onClick={() => openCategory(cat.name)}
+            className="bg-white p-5 rounded-2xl shadow-sm border cursor-pointer hover:shadow-lg transition"
+            style={{ borderLeft: `5px solid ${cat.color}` }}
+          >
+            <div className="flex items-center gap-2 mb-2">
+              <Tag className="w-4 h-4" style={{ color: cat.color }} />
+              <p className="font-semibold text-gray-800">
+                {formatDifficulty(cat.name)}
+              </p>
+            </div>
 
-    <p className="text-3xl font-bold" style={{ color: cat.color }}>
-      {cat.count}
-    </p>
+            <p className="text-3xl font-bold" style={{ color: cat.color }}>
+              {cat.count}
+            </p>
 
-    <p className="text-xs text-gray-500">tugas</p>
-  </div>
-))}
-
+            <p className="text-xs text-gray-500">tugas</p>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -497,7 +674,9 @@ export default function App() {
         >
           ← Kembali
         </button>
-        <h1 className="text-2xl font-bold">{selectedCategory.name}</h1>
+        <h1 className="text-2xl font-bold">
+          {formatDifficulty(selectedCategory.name)}
+        </h1>
         <p className="text-purple-100 text-sm mt-1">
           {selectedCategory.count} tugas
         </p>
@@ -529,6 +708,16 @@ export default function App() {
     const pending = tasks.filter((t) => t.status === "pending").length;
     const total = tasks.length;
 
+    const low = tasks.filter(
+      (t) => (t.difficulty || "").toLowerCase() === "low"
+    ).length;
+    const medium = tasks.filter(
+      (t) => (t.difficulty || "").toLowerCase() === "medium"
+    ).length;
+    const high = tasks.filter(
+      (t) => (t.difficulty || "").toLowerCase() === "high"
+    ).length;
+
     return (
       <div className="pb-20 bg-gray-50 min-h-screen">
         <div className="bg-gradient-to-r from-pink-500 to-rose-600 text-white p-6 rounded-b-[32px]">
@@ -558,17 +747,16 @@ export default function App() {
                     stroke="#10b981"
                     strokeWidth="12"
                     fill="none"
-                    strokeDasharray={`${(completed / total) * 351} 351`}
+                    strokeDasharray={`${
+                      total > 0 ? (completed / total) * 351 : 0
+                    } 351`}
                     className="transition-all"
                   />
                 </svg>
 
                 <div className="absolute inset-0 flex items-center justify-center">
                   <p className="text-3xl font-bold">
-                    {total > 0
-                      ? Math.round((completed / total) * 100)
-                      : 0}
-                    %
+                    {total > 0 ? Math.round((completed / total) * 100) : 0}%
                   </p>
                 </div>
               </div>
@@ -596,6 +784,34 @@ export default function App() {
               <p className="font-semibold">{pending}</p>
             </div>
           </div>
+
+          <div className="bg-white p-6 rounded-2xl shadow-sm border">
+            <h3 className="font-bold mb-3">Tingkat Kesulitan</h3>
+
+            <div className="space-y-3">
+              <div className="flex justify-between">
+                <p className="flex items-center gap-2">
+                  <span className="w-4 h-4 bg-blue-500 rounded"></span>Low
+                </p>
+                <p className="font-semibold">{low}</p>
+              </div>
+
+              <div className="flex justify-between">
+                <p className="flex items-center gap-2">
+                  <span className="w-4 h-4 bg-yellow-500 rounded"></span>
+                  Medium
+                </p>
+                <p className="font-semibold">{medium}</p>
+              </div>
+
+              <div className="flex justify-between">
+                <p className="flex items-center gap-2">
+                  <span className="w-4 h-4 bg-red-500 rounded"></span>High
+                </p>
+                <p className="font-semibold">{high}</p>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     );
@@ -618,6 +834,18 @@ export default function App() {
 
         <h1 className="text-2xl font-bold mt-3">Maulana Yusuf Muhammad</h1>
         <p className="text-indigo-100">NIM 21120123140166</p>
+        {user && (
+          <p className="text-indigo-100 text-xs mt-1">
+            Login sebagai: {user.email}
+          </p>
+        )}
+
+        <button
+          onClick={handleLogout}
+          className="mt-4 px-4 py-2 bg-white text-indigo-600 rounded-xl text-sm font-semibold shadow"
+        >
+          Logout
+        </button>
       </div>
 
       <div className="p-5 space-y-4">
@@ -626,7 +854,7 @@ export default function App() {
           <p className="text-sm text-gray-600 leading-relaxed">
             Aplikasi ini adalah Progressive Web App (PWA) untuk manajemen tugas
             kuliah harian. Pengguna dapat menambahkan tugas, mengatur deadline,
-            menentukan tingkat kesulitan (low, medium, high), memberi status
+            menentukan tingkat kesulitan (Low, Medium, High), memberi status
             selesai/belum, dan melihat statistik penyelesaian tugas secara
             visual. Aplikasi dibangun menggunakan React, terintegrasi dengan
             Supabase sebagai backend database, dan didesain agar ringan,
@@ -715,6 +943,18 @@ export default function App() {
   /* ==========================================================
                         RENDER PAGE
 ========================================================== */
+
+  if (authLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+        <p className="text-gray-500">Memuat...</p>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <AuthPage />;
+  }
 
   return (
     <div className="bg-gray-100 min-h-screen">
