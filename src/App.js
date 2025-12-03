@@ -13,15 +13,34 @@ import {
 import { supabase } from "./supabaseClient";
 
 /* ==========================================================
+                    HELPER
+========================================================== */
+
+function formatDifficulty(value) {
+  const map = {
+    low: "Low",
+    medium: "Medium",
+    high: "High",
+  };
+  return map[value] || value || "-";
+}
+
+/* ==========================================================
                     SUPABASE CRUD SERVICE
 ========================================================== */
 
 const API = {
-  async getTasks() {
-    const { data, error } = await supabase
+  async getTasks(userId) {
+    let query = supabase
       .from("tasks")
       .select("*")
       .order("created_at", { ascending: false });
+
+    if (userId) {
+      query = query.eq("user_id", userId);
+    }
+
+    const { data, error } = await query;
 
     if (error) {
       console.error("Error getTasks:", error);
@@ -95,73 +114,79 @@ const API = {
 
 export default function App() {
   const [page, setPage] = useState("home");
+
+  // AUTH STATE
+  const [user, setUser] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+
+  // TASK STATE
   const [tasks, setTasks] = useState([]);
   const [categories, setCategories] = useState([]);
   const [selectedTask, setSelectedTask] = useState(null);
   const [selectedCategory, setSelectedCategory] = useState(null);
   const [loading, setLoading] = useState(false);
 
-  const [user, setUser] = useState(null);
-  const [authLoading, setAuthLoading] = useState(true);
+  /* ===================== AUTH EFFECT ===================== */
 
-  // Helper buat tampilan difficulty
-  const formatDifficulty = (d) => {
-    if (!d) return "-";
-    const lower = d.toLowerCase();
-    if (lower === "low") return "Low";
-    if (lower === "medium") return "Medium";
-    if (lower === "high") return "High";
-    return d;
-  };
-
-  /* --------- INIT AUTH (CEK SESSION + LISTENER) --------- */
   useEffect(() => {
     const initAuth = async () => {
-      const {
-        data: { session },
-        error,
-      } = await supabase.auth.getSession();
-      if (error) console.error("Error getSession:", error);
-      setUser(session?.user ?? null);
-      setAuthLoading(false);
+      const { data, error } = await supabase.auth.getUser();
+      if (error) {
+        console.error("getUser error:", error);
+      }
+      if (data?.user) {
+        setUser(data.user);
+      }
+      setAuthReady(true);
     };
 
     initAuth();
 
     const {
-      data: authListener,
+      data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
       setUser(session?.user ?? null);
+      if (!session?.user) {
+        setTasks([]);
+        setCategories([]);
+        setPage("home");
+      } else {
+        // reload tasks for new user
+        loadAll(session.user.id);
+      }
     });
 
     return () => {
-      authListener.subscription.unsubscribe();
+      subscription.unsubscribe();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* --------- LOAD DATA KALAU SUDAH LOGIN --------- */
+  /* ===================== LOAD DATA ===================== */
+
   useEffect(() => {
     if (user) {
-      loadAll();
-    } else {
-      setTasks([]);
-      setCategories([]);
+      loadAll(user.id);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
-  async function loadAll() {
-    if (!user) return;
+  async function loadAll(userIdParam) {
+    const currentUserId = userIdParam || user?.id;
+    if (!currentUserId) {
+      setTasks([]);
+      setCategories([]);
+      return;
+    }
 
     setLoading(true);
 
-    const t = await API.getTasks();
+    const t = await API.getTasks(currentUserId);
     setTasks(t);
 
     const categoryMap = {};
     t.forEach((task) => {
-      if (!task.difficulty) return;
-      const key = task.difficulty.toLowerCase();
-
+      const key = task.difficulty || "low";
       if (!categoryMap[key]) {
         categoryMap[key] = {
           name: key,
@@ -200,145 +225,154 @@ export default function App() {
   }
 
   async function openCategory(name) {
-    const key = name.toLowerCase();
-    const filtered = tasks.filter(
-      (t) => (t.difficulty || "").toLowerCase() === key
-    );
+    const filtered = tasks.filter((t) => t.difficulty === name);
 
     setSelectedCategory({
-      name: key,
+      name,
       tasks: filtered,
       count: filtered.length,
       color:
-        key === "high" ? "#ef4444" : key === "medium" ? "#f59e0b" : "#3b82f6",
+        name === "high" ? "#ef4444" : name === "medium" ? "#f59e0b" : "#3b82f6",
     });
 
     setPage("categoryDetail");
   }
 
   async function addNewTask(task) {
-    // user_id akan diisi otomatis oleh Supabase (default auth.uid())
-    await API.addTask(task);
-    await loadAll();
+    if (!user) return null;
+
+    const payload = {
+      ...task,
+      user_id: user.id,
+    };
+
+    const result = await API.addTask(payload);
+    if (result) {
+      await loadAll();
+    }
+    return result;
   }
 
-  const handleLogout = async () => {
-    await supabase.auth.signOut();
-    setPage("home");
-  };
-
   /* ==========================================================
-                      PAGE: AUTH
-  ========================================================== */
+                        PAGE: AUTH
+========================================================== */
 
   const AuthPage = () => {
     const [mode, setMode] = useState("login"); // 'login' | 'register'
-    const [email, setEmail] = useState("");
-    const [password, setPassword] = useState("");
-    const [authMessage, setAuthMessage] = useState("");
-    const [authBusy, setAuthBusy] = useState(false);
-
-    const toggleMode = () => {
-      setAuthMessage("");
-      setMode(mode === "login" ? "register" : "login");
-    };
+    const [form, setForm] = useState({ email: "", password: "" });
+    const [authError, setAuthError] = useState("");
+    const [authLoading, setAuthLoading] = useState(false);
 
     const handleSubmit = async (e) => {
       e.preventDefault();
-      setAuthMessage("");
-      setAuthBusy(true);
+      setAuthError("");
+      setAuthLoading(true);
 
       try {
-        if (mode === "register") {
-          const { error } = await supabase.auth.signUp({
-            email,
-            password,
-          });
-          if (error) throw error;
-          setAuthMessage(
-            "✅ Akun berhasil dibuat. Silakan cek email jika perlu verifikasi, lalu login."
-          );
-          setMode("login");
-        } else {
+        if (mode === "login") {
           const { error } = await supabase.auth.signInWithPassword({
-            email,
-            password,
+            email: form.email,
+            password: form.password,
           });
           if (error) throw error;
-          setAuthMessage("✅ Login berhasil.");
+        } else {
+          const { error } = await supabase.auth.signUp({
+            email: form.email,
+            password: form.password,
+          });
+          if (error) throw error;
+          window.alert("Registrasi berhasil. Kamu sudah login 👍");
         }
       } catch (err) {
         console.error(err);
-        setAuthMessage("❌ " + err.message);
+        setAuthError(err.message || "Terjadi kesalahan.");
       } finally {
-        setAuthBusy(false);
+        setAuthLoading(false);
       }
     };
 
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
-        <div className="w-full max-w-md bg-white shadow-lg rounded-2xl p-6">
-          <h1 className="text-2xl font-bold text-center mb-2">
-            Task Manager Kuliah
+      <div className="min-h-screen bg-gradient-to-b from-blue-500 to-indigo-600 flex items-center justify-center px-4">
+        <div className="bg-white rounded-3xl shadow-2xl w-full max-w-md p-8">
+          <h1 className="text-2xl font-bold text-center text-gray-800 mb-1">
+            Manajemen Tugas Kuliah Harian
           </h1>
-          <p className="text-center text-gray-500 mb-6 text-sm">
-            {mode === "login"
-              ? "Masuk untuk mengelola tugas kuliah harianmu."
-              : "Daftar akun baru untuk mulai menggunakan aplikasi."}
+          <p className="text-center text-sm text-gray-500 mb-6">
+            Login atau daftar dulu untuk menyimpan tugas di Supabase
           </p>
 
-          {authMessage && (
-            <div className="mb-4 p-3 rounded-xl text-sm text-center bg-blue-50 text-blue-700 border border-blue-200">
-              {authMessage}
+          <div className="flex justify-center gap-2 mb-6">
+            <button
+              onClick={() => setMode("login")}
+              className={`px-4 py-2 rounded-full text-sm font-medium ${
+                mode === "login"
+                  ? "bg-blue-600 text-white"
+                  : "bg-gray-100 text-gray-600"
+              }`}
+            >
+              Login
+            </button>
+            <button
+              onClick={() => setMode("register")}
+              className={`px-4 py-2 rounded-full text-sm font-medium ${
+                mode === "register"
+                  ? "bg-blue-600 text-white"
+                  : "bg-gray-100 text-gray-600"
+              }`}
+            >
+              Register
+            </button>
+          </div>
+
+          {authError && (
+            <div className="mb-4 p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700">
+              {authError}
             </div>
           )}
 
           <form onSubmit={handleSubmit} className="space-y-4">
             <div>
-              <p className="text-sm font-semibold mb-1">Email</p>
+              <p className="text-sm font-semibold mb-1 text-gray-700">Email</p>
               <input
                 type="email"
                 required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                className="w-full p-3 border rounded-xl"
+                value={form.email}
+                onChange={(e) =>
+                  setForm((f) => ({ ...f, email: e.target.value }))
+                }
+                className="w-full p-3 border rounded-xl text-sm"
+                placeholder="contoh@undip.ac.id"
               />
             </div>
 
             <div>
-              <p className="text-sm font-semibold mb-1">Password</p>
+              <p className="text-sm font-semibold mb-1 text-gray-700">
+                Password
+              </p>
               <input
                 type="password"
                 required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className="w-full p-3 border rounded-xl"
+                value={form.password}
+                onChange={(e) =>
+                  setForm((f) => ({ ...f, password: e.target.value }))
+                }
+                className="w-full p-3 border rounded-xl text-sm"
+                placeholder="••••••••"
               />
             </div>
 
             <button
               type="submit"
-              disabled={authBusy}
-              className="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold disabled:opacity-50"
+              disabled={authLoading}
+              className="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold text-sm mt-2 disabled:opacity-60"
             >
-              {authBusy
+              {authLoading
                 ? "Memproses..."
                 : mode === "login"
                 ? "Login"
                 : "Register"}
             </button>
           </form>
-
-          <p className="mt-4 text-center text-sm text-gray-600">
-            {mode === "login" ? "Belum punya akun? " : "Sudah punya akun? "}
-            <button
-              type="button"
-              onClick={toggleMode}
-              className="text-blue-600 font-semibold"
-            >
-              {mode === "login" ? "Daftar di sini" : "Login di sini"}
-            </button>
-          </p>
         </div>
       </div>
     );
@@ -389,6 +423,10 @@ export default function App() {
         <div className="space-y-4">
           {loading ? (
             <p className="text-center text-gray-500 py-8">Loading...</p>
+          ) : tasks.length === 0 ? (
+            <p className="text-center text-gray-400 text-sm py-8">
+              Belum ada tugas. Tambah dulu yuk.
+            </p>
           ) : (
             tasks.map((task) => (
               <div
@@ -429,9 +467,9 @@ export default function App() {
 
                     <span
                       className={`ml-3 px-2 py-0.5 rounded-lg text-xs font-medium ${
-                        (task.difficulty || "").toLowerCase() === "high"
+                        task.difficulty === "high"
                           ? "bg-red-100 text-red-600"
-                          : (task.difficulty || "").toLowerCase() === "medium"
+                          : task.difficulty === "medium"
                           ? "bg-yellow-100 text-yellow-600"
                           : "bg-blue-100 text-blue-600"
                       }`}
@@ -452,62 +490,65 @@ export default function App() {
                     PAGE: TASK DETAIL
 ========================================================== */
 
-  const TaskDetailPage = () => (
-    <div className="pb-20 bg-gray-50 min-h-screen">
-      <div className="bg-gradient-to-r from-blue-500 to-blue-600 text-white p-6">
-        <button onClick={() => setPage("home")} className="mb-3 text-white">
-          ← Kembali
-        </button>
-        <h1 className="text-2xl font-bold">{selectedTask.title}</h1>
-      </div>
+  const TaskDetailPage = () => {
+    if (!selectedTask) return null;
 
-      <div className="p-6 space-y-6">
-        <div className="bg-white p-6 rounded-2xl shadow-sm border">
-          <h3 className="font-bold text-gray-800 mb-4">Detail Tugas</h3>
-
-          <div className="space-y-3 text-sm">
-            <p>
-              <span className="text-gray-500">Deskripsi:</span>{" "}
-              {selectedTask.description}
-            </p>
-            <p>
-              <span className="text-gray-500">Kesulitan:</span>{" "}
-              {formatDifficulty(selectedTask.difficulty)}
-            </p>
-            <p>
-              <span className="text-gray-500">Deadline:</span>{" "}
-              {selectedTask.deadline}
-            </p>
-            <p>
-              <span className="text-gray-500">Status:</span>{" "}
-              {selectedTask.status}
-            </p>
-          </div>
+    return (
+      <div className="pb-20 bg-gray-50 min-h-screen">
+        <div className="bg-gradient-to-r from-blue-500 to-blue-600 text-white p-6">
+          <button onClick={() => setPage("home")} className="mb-3 text-white">
+            ← Kembali
+          </button>
+          <h1 className="text-2xl font-bold">{selectedTask.title}</h1>
         </div>
 
-        <button
-          onClick={async () => {
-            // eslint-disable-next-line no-restricted-globals
-            const ok = confirm("Yakin ingin menghapus tugas ini?");
-            if (!ok) return;
+        <div className="p-6 space-y-6">
+          <div className="bg-white p-6 rounded-2xl shadow-sm border">
+            <h3 className="font-bold text-gray-800 mb-4">Detail Tugas</h3>
 
-            const success = await API.deleteTask(selectedTask.id);
+            <div className="space-y-3 text-sm">
+              <p>
+                <span className="text-gray-500">Deskripsi:</span>{" "}
+                {selectedTask.description}
+              </p>
+              <p>
+                <span className="text-gray-500">Kesulitan:</span>{" "}
+                {formatDifficulty(selectedTask.difficulty)}
+              </p>
+              <p>
+                <span className="text-gray-500">Deadline:</span>{" "}
+                {selectedTask.deadline}
+              </p>
+              <p>
+                <span className="text-gray-500">Status:</span>{" "}
+                {selectedTask.status}
+              </p>
+            </div>
+          </div>
 
-            if (success) {
-              alert("🗑️ Tugas berhasil dihapus!");
-              await loadAll();
-              setPage("home");
-            } else {
-              alert("❌ Gagal menghapus tugas!");
-            }
-          }}
-          className="w-full py-3 rounded-xl text-white font-semibold bg-red-500 flex justify-center items-center gap-2"
-        >
-          <Trash2 className="w-5 h-5" /> Hapus Tugas
-        </button>
+          <button
+            onClick={async () => {
+              const ok = window.confirm("Yakin ingin menghapus tugas ini?");
+              if (!ok) return;
+
+              const success = await API.deleteTask(selectedTask.id);
+
+              if (success) {
+                window.alert("🗑️ Tugas berhasil dihapus!");
+                await loadAll();
+                setPage("home");
+              } else {
+                window.alert("❌ Gagal menghapus tugas!");
+              }
+            }}
+            className="w-full py-3 rounded-xl text-white font-semibold bg-red-500 flex justify-center items-center gap-2"
+          >
+            <Trash2 className="w-5 h-5" /> Hapus Tugas
+          </button>
+        </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   /* ==========================================================
                     PAGE: ADD TASK 
@@ -523,6 +564,7 @@ export default function App() {
     });
 
     const [message, setMessage] = useState("");
+    const [saving, setSaving] = useState(false);
 
     async function submit() {
       if (!form.title || !form.description || !form.deadline) {
@@ -530,7 +572,9 @@ export default function App() {
         return;
       }
 
+      setSaving(true);
       const result = await addNewTask(form);
+      setSaving(false);
 
       if (!result) {
         setMessage("❌ Gagal menyimpan tugas baru.");
@@ -542,7 +586,7 @@ export default function App() {
       setTimeout(() => {
         setMessage("");
         setPage("home");
-      }, 1000);
+      }, 800);
     }
 
     return (
@@ -566,7 +610,9 @@ export default function App() {
             <input
               type="text"
               value={form.title}
-              onChange={(e) => setForm({ ...form, title: e.target.value })}
+              onChange={(e) =>
+                setForm({ ...form, title: e.target.value })
+              }
               className="w-full p-3 border rounded-xl"
             />
           </div>
@@ -613,9 +659,10 @@ export default function App() {
           <button
             type="button"
             onClick={submit}
-            className="w-full bg-green-500 text-white p-3 rounded-xl font-semibold"
+            disabled={saving}
+            className="w-full bg-green-500 text-white p-3 rounded-xl font-semibold disabled:opacity-60"
           >
-            Simpan
+            {saving ? "Menyimpan..." : "Simpan"}
           </button>
         </div>
       </div>
@@ -623,7 +670,7 @@ export default function App() {
   };
 
   /* ==========================================================
-                    PAGE: Kesulitan
+                    PAGE: KESULITAN
 ========================================================== */
 
   const CategoriesPage = () => (
@@ -665,39 +712,43 @@ export default function App() {
                     PAGE: CATEGORY DETAIL
 ========================================================== */
 
-  const CategoryDetailPage = () => (
-    <div className="pb-20 bg-gray-50 min-h-screen">
-      <div className="bg-gradient-to-r from-purple-500 to-purple-600 text-white p-6">
-        <button
-          onClick={() => setPage("categories")}
-          className="mb-3 text-white"
-        >
-          ← Kembali
-        </button>
-        <h1 className="text-2xl font-bold">
-          {formatDifficulty(selectedCategory.name)}
-        </h1>
-        <p className="text-purple-100 text-sm mt-1">
-          {selectedCategory.count} tugas
-        </p>
-      </div>
+  const CategoryDetailPage = () => {
+    if (!selectedCategory) return null;
 
-      <div className="p-4 space-y-4">
-        {selectedCategory.tasks.map((task) => (
-          <div
-            key={task.id}
-            className="bg-white p-4 rounded-xl shadow-sm border cursor-pointer hover:shadow-md transition"
-            onClick={() => openTask(task.id)}
+    return (
+      <div className="pb-20 bg-gray-50 min-h-screen">
+        <div className="bg-gradient-to-r from-purple-500 to-purple-600 text-white p-6">
+          <button
+            onClick={() => setPage("categories")}
+            className="mb-3 text-white"
           >
-            <p className="font-semibold text-gray-800">{task.title}</p>
-            <p className="text-xs text-gray-500 mt-1 flex items-center gap-1">
-              <Calendar className="w-3 h-3" /> {task.deadline}
-            </p>
-          </div>
-        ))}
+            ← Kembali
+          </button>
+          <h1 className="text-2xl font-bold">
+            {formatDifficulty(selectedCategory.name)}
+          </h1>
+          <p className="text-purple-100 text-sm mt-1">
+            {selectedCategory.count} tugas
+          </p>
+        </div>
+
+        <div className="p-4 space-y-4">
+          {selectedCategory.tasks.map((task) => (
+            <div
+              key={task.id}
+              className="bg-white p-4 rounded-xl shadow-sm border cursor-pointer hover:shadow-md transition"
+              onClick={() => openTask(task.id)}
+            >
+              <p className="font-semibold text-gray-800">{task.title}</p>
+              <p className="text-xs text-gray-500 mt-1 flex items-center gap-1">
+                <Calendar className="w-3 h-3" /> {task.deadline}
+              </p>
+            </div>
+          ))}
+        </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   /* ==========================================================
                     PAGE: STATISTICS
@@ -708,15 +759,9 @@ export default function App() {
     const pending = tasks.filter((t) => t.status === "pending").length;
     const total = tasks.length;
 
-    const low = tasks.filter(
-      (t) => (t.difficulty || "").toLowerCase() === "low"
-    ).length;
-    const medium = tasks.filter(
-      (t) => (t.difficulty || "").toLowerCase() === "medium"
-    ).length;
-    const high = tasks.filter(
-      (t) => (t.difficulty || "").toLowerCase() === "high"
-    ).length;
+    const low = tasks.filter((t) => t.difficulty === "low").length;
+    const medium = tasks.filter((t) => t.difficulty === "medium").length;
+    const high = tasks.filter((t) => t.difficulty === "high").length;
 
     return (
       <div className="pb-20 bg-gray-50 min-h-screen">
@@ -747,9 +792,7 @@ export default function App() {
                     stroke="#10b981"
                     strokeWidth="12"
                     fill="none"
-                    strokeDasharray={`${
-                      total > 0 ? (completed / total) * 351 : 0
-                    } 351`}
+                    strokeDasharray={`${total > 0 ? (completed / total) * 351 : 0} 351`}
                     className="transition-all"
                   />
                 </svg>
@@ -835,17 +878,8 @@ export default function App() {
         <h1 className="text-2xl font-bold mt-3">Maulana Yusuf Muhammad</h1>
         <p className="text-indigo-100">NIM 21120123140166</p>
         {user && (
-          <p className="text-indigo-100 text-xs mt-1">
-            Login sebagai: {user.email}
-          </p>
+          <p className="text-indigo-100 text-xs mt-1">{user.email}</p>
         )}
-
-        <button
-          onClick={handleLogout}
-          className="mt-4 px-4 py-2 bg-white text-indigo-600 rounded-xl text-sm font-semibold shadow"
-        >
-          Logout
-        </button>
       </div>
 
       <div className="p-5 space-y-4">
@@ -880,6 +914,16 @@ export default function App() {
             </div>
           </div>
         </div>
+
+        <button
+          onClick={async () => {
+            await supabase.auth.signOut();
+            window.alert("Kamu sudah logout.");
+          }}
+          className="w-full bg-red-500 text-white py-3 rounded-xl font-semibold text-sm"
+        >
+          Logout
+        </button>
       </div>
     </div>
   );
@@ -944,10 +988,10 @@ export default function App() {
                         RENDER PAGE
 ========================================================== */
 
-  if (authLoading) {
+  if (!authReady) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-50">
-        <p className="text-gray-500">Memuat...</p>
+        <p className="text-gray-500 text-sm">Memuat...</p>
       </div>
     );
   }
